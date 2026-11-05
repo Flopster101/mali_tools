@@ -1,7 +1,17 @@
 import sys
+import os
 import struct
 
-def patch_mali_ddk(filepath):
+
+def patched_path(filepath):
+    """Sibling path carrying the _patched suffix, preserving the .so.* tail."""
+    root, ext = os.path.splitext(filepath)
+    if root.endswith('_patched'):
+        return filepath
+    return f"{root}_patched{ext}"
+
+
+def patch_mali_ddk(filepath, outpath=None):
     print(f"[*] Opening {filepath}...")
     with open(filepath, 'rb') as f:
         data = bytearray(f.read())
@@ -210,6 +220,12 @@ def patch_mali_ddk(filepath):
         for offset in range(ref_offset - 4, ref_offset - 0x1000, -4):
             inst = struct.unpack_from('<I', data, offset)[0]
             if inst == 0xd65f03c0: # ret
+                # A bypassed entry is `mov w0,#1; ret`, so the scan finds the
+                # stub's own ret one word in. Step back so re-runs resolve to
+                # the entry instead of the prologue that follows it.
+                if data[offset-4:offset] == b'\x20\x00\x80\x52':
+                    func_start_offset = offset - 4
+                    break
                 entry_offset = offset + 4
                 while entry_offset < ref_offset:
                     first_inst = struct.unpack_from('<I', data, entry_offset)[0]
@@ -232,6 +248,11 @@ def patch_mali_ddk(filepath):
         for offset in range(ref_offset - 2, ref_offset - 0x1000, -2):
             if offset < 0:
                 break
+            # A bypassed entry is `movs r0,#1; bx lr` and no longer looks like
+            # a push, so match the stub first and stop there for re-runs.
+            if data[offset:offset+4] == b'\x01\x20\x70\x47':
+                func_start_offset = offset
+                break
             inst = struct.unpack_from('<H', data, offset)[0]
             # 16-bit push {..., lr} -> (inst & 0xff00) == 0xb500
             if (inst & 0xff00) == 0xb500:
@@ -250,6 +271,11 @@ def patch_mali_ddk(filepath):
                 if offset < 0:
                     break
                 inst = struct.unpack_from('<H', data, offset)[0]
+                # A bypassed entry is `movs r0,#1; bx lr`, so this scan finds
+                # the stub's own bx lr. Step back to the entry for re-runs.
+                if inst == 0x4770 and data[offset-2:offset] == b'\x01\x20':
+                    func_start_offset = offset - 2
+                    break
                 if inst == 0x4770 or (inst & 0xff00) == 0xbd00:
                     entry_offset = offset + 2
                     while entry_offset < ref_offset:
@@ -288,13 +314,6 @@ def patch_mali_ddk(filepath):
                         entry_offset += 4
                     break
 
-    if func_start_offset is None:
-        print("[-] Error: Could not determine the function start address.")
-        return False
-
-    func_start_va = offset_to_va(func_start_offset)
-    print(f"[+] Found function start at offset 0x{func_start_offset:x} (VA 0x{func_start_va:x}) [mode: {mode}]")
-
     # 5. Patch the function start to return true (1) immediately
     if mode == "arm64":
         # mov w0, #1 -> 0x52800020, ret -> 0xd65f03c0
@@ -306,17 +325,32 @@ def patch_mali_ddk(filepath):
         # mov r0, #1 -> 0xe3a00001, bx lr -> 0xe12fff1e
         patch_bytes = b'\x01\x00\xa0\xe3\x1e\xff\x2f\xe1'
 
-    print(f"[+] Patching {len(patch_bytes)} bytes at offset 0x{func_start_offset:x}...")
+    if func_start_offset is None:
+        print("[-] Error: Could not determine the function start address.")
+        return False
+
+    func_start_va = offset_to_va(func_start_offset)
+    print(f"[+] Found function start at offset 0x{func_start_offset:x} (VA 0x{func_start_va:x}) [mode: {mode}]")
+
     original_bytes = data[func_start_offset:func_start_offset+len(patch_bytes)]
+    dest = outpath or patched_path(filepath)
+
+    if original_bytes == patch_bytes:
+        print(f"[=] Already patched at 0x{func_start_offset:x}; nothing to do.")
+        print(f"[*] Saving patched binary to {dest}...")
+        with open(dest, 'wb') as f:
+            f.write(data)
+        return True
+
+    print(f"[+] Patching {len(patch_bytes)} bytes at offset 0x{func_start_offset:x}...")
     print(f"    Original bytes: {original_bytes.hex()}")
     print(f"    New bytes:      {patch_bytes.hex()}")
-    
+
     data[func_start_offset:func_start_offset+len(patch_bytes)] = patch_bytes
     print("[+] GPU compatibility check bypassed.")
 
-    # Save patched binary in-place (overwrites the original blob)
-    print(f"[*] Saving patched binary to {filepath}...")
-    with open(filepath, 'wb') as f:
+    print(f"[*] Saving patched binary to {dest}...")
+    with open(dest, 'wb') as f:
         f.write(data)
 
     print("[+] Patching complete! GPU check bypassed.")
@@ -324,6 +358,8 @@ def patch_mali_ddk(filepath):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python patch_mali.py <path_to_libGLES_mali.so>")
+        print("Usage: python patch_mali.py <path_to_libGLES_mali.so> [output_path]")
+        print("Writes <name>_patched.so alongside the input unless output_path is given.")
         sys.exit(1)
-    patch_mali_ddk(sys.argv[1])
+    out = sys.argv[2] if len(sys.argv) > 2 else None
+    sys.exit(0 if patch_mali_ddk(sys.argv[1], out) else 1)
